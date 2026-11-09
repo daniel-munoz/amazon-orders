@@ -8,7 +8,7 @@ import os
 import re
 import sys
 from collections import defaultdict
-from collections.abc import Mapping
+from collections.abc import Collection, Mapping
 from dataclasses import asdict, dataclass, field
 from datetime import date, datetime
 from pathlib import Path
@@ -258,6 +258,9 @@ def _status_lines(charge: Charge) -> list[str]:
         else:
             lines.append("This is the only charge found for this order, and it differs from the order total.")
         lines.append("These items can't be attributed to this specific charge.")
+    elif charge.status == REFUND and charge.order is None:
+        detail = charge.lookup_error or "Amazon did not link this refund to an order"
+        lines.append(f"Order details not available: {escape_md(detail)}")
     for other in charge.related:
         if other.is_refund:
             lines.append(f"Refund of {_money(other.amount)} on {other.date} for this order.")
@@ -276,7 +279,7 @@ def _charge_block(charge: Charge) -> str:
     if charge.seller:
         parts.append(f"Statement text: {escape_md(charge.seller)}")
     parts.extend(_status_lines(charge))
-    order_link = safe_url(charge.order_link or (charge.order.link if charge.order else None))
+    order_link = safe_url(charge.order_link) or safe_url(charge.order.link if charge.order else None)
     if order_link:
         parts.append(f"[View order]({order_link})")
     if charge.order:
@@ -331,11 +334,41 @@ def build_config(config_path: str | None = None) -> AmazonOrdersConfig:
                               data={"warn_on_missing_required_field": True, "max_auth_attempts": 3})
 
 
-def credentials_problem(config, environ: Mapping[str, str]) -> str | None:
+class LoginFailed(Exception):
+    """Amazon needs a sign-in that couldn't be completed, so fetching can't continue."""
+
+
+def _has_credentials(environ: Mapping[str, str]) -> bool:
+    return bool(environ.get("AMAZON_USERNAME") and environ.get("AMAZON_PASSWORD"))
+
+
+def credentials_problem(session, environ: Mapping[str, str]) -> str | None:
     """Explain what's missing when there's neither a saved session nor credentials to log in with."""
-    if os.path.exists(config.cookie_jar_path) or (environ.get("AMAZON_USERNAME") and environ.get("AMAZON_PASSWORD")):
+    if session.auth_cookies_stored() or _has_credentials(environ):
         return None
     return "No saved Amazon session found. Set AMAZON_USERNAME and AMAZON_PASSWORD to log in."
+
+
+def _login_again(session) -> None:
+    if not _has_credentials(os.environ):
+        raise LoginFailed("The saved Amazon session has expired. Set AMAZON_USERNAME and AMAZON_PASSWORD to log in.")
+    try:
+        # login() starts fresh after Amazon has redirected a request to sign-in.
+        session.login()
+    except Exception as error:
+        raise LoginFailed(f"Could not log in to Amazon: {error}") from error
+
+
+def _retry_after_login(session, fetch):
+    """Run fetch, signing in again and retrying once if Amazon rejects the session."""
+    try:
+        return fetch()
+    except AmazonOrdersAuthRedirectError:
+        _login_again(session)
+    try:
+        return fetch()
+    except AmazonOrdersAuthRedirectError as error:
+        raise LoginFailed(f"Could not log in to Amazon: it still asks to sign in. {error}") from error
 
 
 class _WarningCounter(logging.Handler):
@@ -347,24 +380,23 @@ class _WarningCounter(logging.Handler):
         self.count += 1
 
 
-def fetch_charges(session, start: date, end: date, today: date) -> tuple[list[Charge], int]:
-    """Return the charges in range, and how many transaction rows the library skipped as unreadable."""
+def fetch_charges(session, start: date, end: date, today: date) -> tuple[list[Charge], int, set[str]]:
+    """Return the charges in range, how many rows the library skipped, and every order number seen in the feed."""
     days = lookback_days(start, today)
     counter = _WarningCounter()
     library_logger = logging.getLogger("amazonorders.transactions")
     library_logger.addHandler(counter)
+
+    def fetch():
+        counter.count = 0
+        return AmazonTransactions(session).get_transactions(days=days)
+
     try:
-        try:
-            transactions = AmazonTransactions(session).get_transactions(days=days)
-        except AmazonOrdersAuthRedirectError:
-            # The saved session expired; login() starts fresh after a redirect to sign-in.
-            counter.count = 0
-            session.login()
-            transactions = AmazonTransactions(session).get_transactions(days=days)
+        transactions = _retry_after_login(session, fetch)
     finally:
         library_logger.removeHandler(counter)
     charges = [to_charge(t) for t in transactions if start <= t.completed_date <= end]
-    return charges, counter.count
+    return charges, counter.count, {t.order_number for t in transactions if t.order_number}
 
 
 def attach_orders(session, charges: list[Charge]) -> None:
@@ -377,7 +409,10 @@ def attach_orders(session, charges: list[Charge]) -> None:
             continue
         if number not in results:
             try:
-                results[number] = to_order_view(amazon_orders.get_order(number))
+                results[number] = to_order_view(
+                    _retry_after_login(session, lambda: amazon_orders.get_order(number)))
+            except LoginFailed:
+                raise
             except Exception as error:
                 logger.warning("Could not load order %s: %s", number, error)
                 results[number] = str(error) or type(error).__name__
@@ -388,17 +423,31 @@ def attach_orders(session, charges: list[Charge]) -> None:
             charge.order = result
 
 
-def fetch_uncharged_orders(session, charges: list[Charge], start: date, end: date) -> tuple[list[OrderView], list[str]]:
-    """Find orders placed in range with no charge, from both the regular and the digital history."""
+def _by_placed_date(orders) -> list[OrderView]:
+    return sorted(orders, key=lambda o: (o.placed_date is None, o.placed_date or date.min))
+
+
+def fetch_uncharged_orders(session, charges: list[Charge], start: date, end: date,
+                           charged_elsewhere: Collection[str] = ()) -> tuple[list[OrderView], list[str]]:
+    """Find orders placed in range with no charge, from both the regular and the digital history.
+
+    charged_elsewhere holds order numbers charged outside the range, which aren't missing a charge.
+    """
     amazon_orders = AmazonOrders(session)
-    charged = {c.order_number for c in charges if c.order_number}
+    charged = {c.order_number for c in charges if c.order_number} | set(charged_elsewhere)
     found: dict[str, OrderView] = {}
     warnings: list[str] = []
     for year in years_in_range(start, end):
         for order_filter, label in ((None, "regular"), (DIGITAL_ORDERS_FILTER, "digital")):
             try:
-                orders = amazon_orders.get_orders(year=year, order_filter=order_filter)
+                orders = _retry_after_login(
+                    session, lambda: amazon_orders.get_orders(year=year, order_filter=order_filter))
                 views = [to_order_view(o) for o in orders]
+            except LoginFailed as error:
+                # Stop here: more sign-in attempts risk flagging the account.
+                logger.warning("Stopped checking orders: %s", error)
+                warnings.append(f"Stopped checking orders from {label} {year} onward: {error}")
+                return _by_placed_date(found.values()), warnings
             except Exception as error:
                 logger.warning("Could not check %s orders for %s: %s", label, year, error)
                 warnings.append(f"Could not check {label} orders for {year}, so some orders may be missing here: {error}")
@@ -407,8 +456,7 @@ def fetch_uncharged_orders(session, charges: list[Charge], start: date, end: dat
                 in_range = view.placed_date is None or start <= view.placed_date <= end
                 if in_range and view.order_number not in charged:
                     found[view.order_number] = view
-    ordered = sorted(found.values(), key=lambda o: (o.placed_date is None, o.placed_date or date.min))
-    return ordered, warnings
+    return _by_placed_date(found.values()), warnings
 
 
 def _fail(message: str) -> int:
@@ -421,25 +469,25 @@ def main(argv: list[str] | None = None, today: date | None = None) -> int:
     today = today or date.today()
     logging.basicConfig(level=logging.WARNING, format="%(levelname)s: %(message)s")
 
-    config = build_config()
-    problem = credentials_problem(config, os.environ)
-    if problem:
-        return _fail(problem)
-
     try:
-        session = AmazonSession(config=config)
+        session = AmazonSession(config=build_config())
+        problem = credentials_problem(session, os.environ)
+        if problem:
+            return _fail(problem)
         session.login()
     except Exception as error:
         return _fail(f"Could not log in to Amazon: {error}")
 
     try:
-        charges, skipped_rows = fetch_charges(session, args.start, args.end, today)
+        charges, skipped_rows, seen_order_numbers = fetch_charges(session, args.start, args.end, today)
+        attach_orders(session, charges)
+    except LoginFailed as error:
+        return _fail(f"{error} No report was written.")
     except Exception as error:
         return _fail(f"Could not read Amazon's transactions, so no report was written: {error}")
 
-    attach_orders(session, charges)
     classify(charges)
-    uncharged, warnings = fetch_uncharged_orders(session, charges, args.start, args.end)
+    uncharged, warnings = fetch_uncharged_orders(session, charges, args.start, args.end, seen_order_numbers)
     if skipped_rows:
         rows = "1 row" if skipped_rows == 1 else f"{skipped_rows} rows"
         warnings.insert(0, f"{rows} of Amazon's transactions could not be read, so charges may be missing.")

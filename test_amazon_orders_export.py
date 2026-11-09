@@ -227,12 +227,18 @@ def test_build_config(tmp_path):
     assert c.warn_on_missing_required_field is True and c.max_auth_attempts == 3
 
 
-def test_credentials_problem(tmp_path):
-    c_jar = SimpleNamespace(cookie_jar_path=str(tmp_path / "missing.json"))
-    assert "AMAZON_USERNAME" in export.credentials_problem(c_jar, {})
-    assert export.credentials_problem(c_jar, {"AMAZON_USERNAME": "u", "AMAZON_PASSWORD": "p"}) is None
-    (tmp_path / "jar.json").write_text("[]")
-    assert export.credentials_problem(SimpleNamespace(cookie_jar_path=str(tmp_path / "jar.json")), {}) is None
+def test_credentials_problem():
+    signed_out = SimpleNamespace(auth_cookies_stored=lambda: False)
+    assert "AMAZON_USERNAME" in export.credentials_problem(signed_out, {})
+    assert export.credentials_problem(signed_out, {"AMAZON_USERNAME": "u", "AMAZON_PASSWORD": "p"}) is None
+    assert export.credentials_problem(SimpleNamespace(auth_cookies_stored=lambda: True), {}) is None
+
+
+def test_cookie_file_without_sign_in_cookies_is_not_a_saved_session(tmp_path):
+    jar = tmp_path / "jar.json"
+    jar.write_text("[]")
+    config = export.AmazonOrdersConfig(config_path=str(tmp_path / "c.yml"), data={"cookie_jar_path": str(jar)})
+    assert "AMAZON_USERNAME" in export.credentials_problem(export.AmazonSession(config=config), {})
 
 
 def test_fetch_charges_filters_range_and_uses_lookback(monkeypatch):
@@ -243,8 +249,14 @@ def test_fetch_charges_filters_range_and_uses_lookback(monkeypatch):
         return [txn(date(2025, 2, 28)), txn(date(2025, 3, 1)), txn(date(2025, 3, 31)), txn(date(2025, 4, 1))]
 
     patch_txns(monkeypatch, get)
-    charges, skipped = export.fetch_charges(object(), date(2025, 3, 1), date(2025, 3, 31), date(2025, 4, 10))
+    charges, skipped, _ = export.fetch_charges(object(), date(2025, 3, 1), date(2025, 3, 31), date(2025, 4, 10))
     assert seen["days"] == 41 and [c.date.day for c in charges] == [1, 31] and skipped == 0
+
+
+def test_fetch_charges_reports_order_numbers_charged_outside_the_range(monkeypatch):
+    patch_txns(monkeypatch, lambda days: [txn(date(2025, 4, 2), number="LATER"), txn(date(2025, 3, 5))])
+    _, _, seen = export.fetch_charges(object(), date(2025, 3, 1), date(2025, 3, 31), date(2025, 4, 10))
+    assert seen == {"LATER", ONE}
 
 
 def test_fetch_charges_counts_rows_the_library_skipped(monkeypatch):
@@ -253,10 +265,99 @@ def test_fetch_charges_counts_rows_the_library_skipped(monkeypatch):
         return []
 
     patch_txns(monkeypatch, get)
-    assert export.fetch_charges(object(), date(2025, 3, 1), date(2025, 3, 2), date(2025, 3, 3)) == ([], 1)
+    assert export.fetch_charges(object(), date(2025, 3, 1), date(2025, 3, 2), date(2025, 3, 3)) == ([], 1, set())
+
+
+def set_credentials(monkeypatch):
+    monkeypatch.setenv("AMAZON_USERNAME", "u")
+    monkeypatch.setenv("AMAZON_PASSWORD", "p")
+
+
+def test_expired_session_without_credentials_is_a_clear_error_and_does_not_log_in(monkeypatch):
+    monkeypatch.delenv("AMAZON_USERNAME", raising=False)
+    monkeypatch.delenv("AMAZON_PASSWORD", raising=False)
+    logins = []
+
+    def get(days):
+        raise AmazonOrdersAuthRedirectError("expired")
+
+    patch_txns(monkeypatch, get)
+    with pytest.raises(export.LoginFailed, match="AMAZON_USERNAME"):
+        export.fetch_charges(SimpleNamespace(login=lambda: logins.append(1)), date(2025, 3, 1), date(2025, 3, 2),
+                             date(2025, 3, 3))
+    assert logins == []
+
+
+def test_skipped_row_count_is_reset_for_the_retry_after_login(monkeypatch):
+    set_credentials(monkeypatch)
+    calls = []
+
+    def get(days):
+        calls.append(1)
+        if len(calls) == 1:
+            logging.getLogger("amazonorders.transactions").warning("skipped before the redirect")
+            raise AmazonOrdersAuthRedirectError("expired")
+        return []
+
+    patch_txns(monkeypatch, get)
+    result = export.fetch_charges(SimpleNamespace(login=lambda: None), date(2025, 3, 1), date(2025, 3, 2),
+                                  date(2025, 3, 3))
+    assert result[1] == 0
+
+
+def test_attach_orders_logs_in_again_once_when_redirected(monkeypatch):
+    set_credentials(monkeypatch)
+    calls, logins = [], []
+
+    def get_order(n):
+        calls.append(n)
+        if len(calls) == 1:
+            raise AmazonOrdersAuthRedirectError("sign in again")
+        return lib_order(n)
+
+    patch_orders(monkeypatch, get_order=get_order)
+    c = charge(o=None)
+    export.attach_orders(SimpleNamespace(login=lambda: logins.append(1)), [c])
+    assert c.order is not None and c.lookup_error is None and len(logins) == 1
+
+
+def test_attach_orders_stops_when_still_redirected_after_login(monkeypatch):
+    set_credentials(monkeypatch)
+    logins = []
+
+    def get_order(n):
+        raise AmazonOrdersAuthRedirectError("sign in again")
+
+    patch_orders(monkeypatch, get_order=get_order)
+    with pytest.raises(export.LoginFailed):
+        export.attach_orders(SimpleNamespace(login=lambda: logins.append(1)),
+                             [charge(number="A", o=None), charge(number="B", o=None)])
+    assert len(logins) == 1
+
+
+def test_uncharged_orders_stops_logging_in_after_a_failed_login_and_warns(monkeypatch):
+    monkeypatch.delenv("AMAZON_USERNAME", raising=False)
+    monkeypatch.delenv("AMAZON_PASSWORD", raising=False)
+    calls = []
+
+    def get_orders(year, order_filter=None):
+        calls.append(year)
+        raise AmazonOrdersAuthRedirectError("sign in again")
+
+    patch_orders(monkeypatch, get_orders=get_orders)
+    _, warnings = export.fetch_uncharged_orders(SimpleNamespace(login=lambda: None), [], date(2024, 3, 1),
+                                                date(2025, 3, 31))
+    assert len(calls) == 1 and len(warnings) == 1 and "AMAZON_USERNAME" in warnings[0]
+
+
+def test_uncharged_orders_excludes_orders_charged_outside_the_range(monkeypatch):
+    patch_orders(monkeypatch, get_orders=lambda year, order_filter=None: [lib_order("LATER"), lib_order("NONE")])
+    found, _ = export.fetch_uncharged_orders(object(), [], date(2025, 3, 1), date(2025, 3, 31), {"LATER"})
+    assert [o.order_number for o in found] == ["NONE"]
 
 
 def test_fetch_charges_logs_in_again_once_when_session_expired(monkeypatch):
+    set_credentials(monkeypatch)
     calls, logins = [], []
 
     def get(days):
@@ -322,7 +423,8 @@ def wired(monkeypatch, tmp_path):
     monkeypatch.setenv("AMAZON_PASSWORD", "p")
     monkeypatch.setattr(export, "build_config", lambda: export.AmazonOrdersConfig(
         config_path=str(tmp_path / "c.yml"), data={"cookie_jar_path": str(tmp_path / "jar.json")}))
-    monkeypatch.setattr(export, "AmazonSession", lambda config: SimpleNamespace(login=lambda: None))
+    monkeypatch.setattr(export, "AmazonSession", lambda config: SimpleNamespace(
+        login=lambda: None, auth_cookies_stored=lambda: False))
     patch_txns(monkeypatch, lambda days: [txn(date(2025, 3, 14))])
     patch_orders(monkeypatch, get_order=lambda n: lib_order(n), get_orders=lambda year, order_filter=None: [])
     return tmp_path / "sub" / "out.md"
@@ -360,8 +462,40 @@ def test_main_login_failure_exits_without_report(wired, monkeypatch, capsys):
     def fail():
         raise AmazonOrdersAuthError("bad login")
 
-    monkeypatch.setattr(export, "AmazonSession", lambda config: SimpleNamespace(login=fail))
+    monkeypatch.setattr(export, "AmazonSession", lambda config: SimpleNamespace(
+        login=fail, auth_cookies_stored=lambda: False))
     assert run(wired) == 1 and not wired.exists() and "bad login" in capsys.readouterr().err
+
+
+def test_main_reports_failed_relogin_as_a_login_failure(wired, monkeypatch, capsys):
+    from amazonorders.exception import AmazonOrdersAuthError
+    attempts = []
+
+    def login():
+        attempts.append(1)
+        if len(attempts) > 1:
+            raise AmazonOrdersAuthError("wrong password")
+
+    def expired(days):
+        raise AmazonOrdersAuthRedirectError("expired")
+
+    monkeypatch.setattr(export, "AmazonSession", lambda config: SimpleNamespace(
+        login=login, auth_cookies_stored=lambda: True))
+    patch_txns(monkeypatch, expired)
+    err_code = run(wired)
+    err = capsys.readouterr().err
+    assert err_code == 1 and not wired.exists() and "Could not log in" in err and "transactions" not in err
+
+
+def test_refund_with_failed_lookup_says_so():
+    md = export.render_markdown(report([charge(refund=True, o=None, error="page changed")]))
+    assert "Order details not available: page changed" in md
+
+
+def test_view_order_falls_back_when_transaction_link_is_relative():
+    c = charge()
+    c.order_link = "/gp/your-account/order-details?orderID=1"
+    assert "[View order](https://www.amazon.com/o)" in export.render_markdown(report([c]))
 
 
 def test_main_feed_failure_exits_without_report(wired, monkeypatch):
