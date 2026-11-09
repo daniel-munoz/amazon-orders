@@ -1,4 +1,5 @@
-from datetime import date
+import json
+from datetime import date, datetime
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -113,3 +114,88 @@ def test_refund_does_not_split_purchase_and_they_reference_each_other():
 def test_unresolved_reasons(c, reason):
     export.classify([c])
     assert (c.status, c.reason) == (export.UNRESOLVED, reason)
+
+
+def report(charges=(), uncharged=(), warnings=()):
+    cs = list(charges)
+    export.classify(cs)
+    return export.Report(date(2025, 3, 1), date(2025, 3, 31), datetime(2025, 4, 1, 9), cs, list(uncharged),
+                         list(warnings))
+
+
+def test_escape_md_handles_markup_and_newlines():
+    assert export.escape_md("A [b] *c*\n_d_") == r"A \[b\] \*c\* \_d\_"
+    assert export.escape_md(None) == "not available"
+
+
+def test_safe_url():
+    assert export.safe_url("https://a.com/x(1) y") == "https://a.com/x%281%29%20y"
+    assert export.safe_url("javascript:alert(1)") is None and export.safe_url(None) is None
+
+
+def test_split_charge_block():
+    a, b = charge(amount=12.99, o=order(total=27.98), day=14), charge(amount=14.99, o=order(total=27.98), day=15)
+    md = export.render_markdown(report([a, b]))
+    assert r"### 2025-03-14 · $12.99 · Visa \*\*\*\*1234 · Split" in md
+    assert "Charge 1 of 2 for this order. Charges in this report total $27.98." in md
+    assert "These items can't be attributed to this specific charge." in md
+    assert "**Book**, qty 1, $12.99" in md and "![Book](https://m.media-amazon.com/i.jpg)" in md
+
+
+def test_single_split_explains_the_difference():
+    md = export.render_markdown(report([charge(amount=5, o=order(total=20))]))
+    assert "This is the only charge found for this order, and it differs from the order total." in md
+
+
+def test_unresolved_comes_first_and_shows_reason():
+    md = export.render_markdown(report([charge(day=1), charge(o=order(total=None), day=20)]))
+    assert md.index("## Unresolved charges") < md.index("## Charges")
+    assert "Order total not available" in md and "amount not verified" in md
+
+
+def test_missing_image_and_fields_still_render():
+    bare = export.OrderView(ONE, None, 12.99, None, False, [],
+                            [export.ItemView(None, None, None, None, None, None)])
+    md = export.render_markdown(report([charge(o=bare)]))
+    assert "![" not in md and "not available" in md
+
+
+def test_shipments_group_items():
+    o = export.OrderView(ONE, date(2025, 3, 1), 12.99, None, False,
+                         [export.ShipmentView("Delivered March 15", [item()])], [item()])
+    md = export.render_markdown(report([charge(o=o)]))
+    assert "**Shipment: Delivered March 15**" in md and md.count("**Book**") == 1
+
+
+def test_refund_notes_its_purchase():
+    md = export.render_markdown(report([charge(day=14), charge(refund=True, day=20)]))
+    assert "Refund" in md and "2025-03-20" in md and "2025-03-14" in md
+
+
+def test_order_line_and_statement_text():
+    c = charge()
+    c.seller = "AMZN Digital"
+    c.order_link = "https://www.amazon.com/o1"
+    md = export.render_markdown(report([c]))
+    assert f"Order {ONE}, placed 2025-03-12, order total $12.99" in md
+    assert "Statement text: AMZN Digital" in md and "[View order](https://www.amazon.com/o1)" in md
+
+
+def test_warnings_and_counts_at_top():
+    md = export.render_markdown(report([charge()], warnings=["2 rows could not be read"]))
+    assert md.index("2 rows could not be read") < md.index("### 2025-03-14") and "Matched: 1" in md
+
+
+def test_empty_period_says_so():
+    assert "No charges found in this period." in export.render_markdown(report())
+
+
+def test_uncharged_orders_section_marks_cancelled():
+    o = export.OrderView("D01-1", date(2025, 3, 2), None, None, True, [], [item()])
+    md = export.render_markdown(report(uncharged=[o]))
+    assert "## Orders with no charge found" in md and "D01-1" in md and "cancelled" in md
+
+
+def test_json_round_trips():
+    data = json.loads(export.render_json(report([charge()])))
+    assert data["charges"][0]["status"] == "Matched" and data["start"] == "2025-03-01"
