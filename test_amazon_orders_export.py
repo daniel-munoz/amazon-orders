@@ -311,3 +311,79 @@ def test_uncharged_orders_warns_about_the_part_that_failed(monkeypatch):
     patch_orders(monkeypatch, get_orders=get_orders)
     _, warnings = export.fetch_uncharged_orders(object(), [], date(2025, 3, 1), date(2025, 3, 31))
     assert len(warnings) == 1 and "digital" in warnings[0] and "2025" in warnings[0]
+
+
+ARGS = ["--start", "2025-03-01", "--end", "2025-03-31"]
+
+
+@pytest.fixture
+def wired(monkeypatch, tmp_path):
+    monkeypatch.setenv("AMAZON_USERNAME", "u")
+    monkeypatch.setenv("AMAZON_PASSWORD", "p")
+    monkeypatch.setattr(export, "build_config", lambda: export.AmazonOrdersConfig(
+        config_path=str(tmp_path / "c.yml"), data={"cookie_jar_path": str(tmp_path / "jar.json")}))
+    monkeypatch.setattr(export, "AmazonSession", lambda config: SimpleNamespace(login=lambda: None))
+    patch_txns(monkeypatch, lambda days: [txn(date(2025, 3, 14))])
+    patch_orders(monkeypatch, get_order=lambda n: lib_order(n), get_orders=lambda year, order_filter=None: [])
+    return tmp_path / "sub" / "out.md"
+
+
+def run(out, today=date(2025, 4, 1), extra=()):
+    return export.main([*ARGS, "--out", str(out), *extra], today=today)
+
+
+def test_main_writes_report_creating_parent_folder(wired):
+    assert run(wired) == 0 and "### 2025-03-14" in wired.read_text(encoding="utf-8")
+
+
+def test_main_json(wired):
+    assert run(wired, extra=["--json"]) == 0 and "charges" in json.loads(wired.read_text(encoding="utf-8"))
+
+
+def test_main_empty_period_writes_report(wired, monkeypatch):
+    patch_txns(monkeypatch, lambda days: [])
+    assert run(wired) == 0 and "No charges found" in wired.read_text(encoding="utf-8")
+
+
+def test_main_reports_skipped_rows_at_top(wired, monkeypatch):
+    def get(days):
+        logging.getLogger("amazonorders.transactions").warning("x")
+        return []
+
+    patch_txns(monkeypatch, get)
+    assert run(wired) == 0 and "1 row" in wired.read_text(encoding="utf-8")
+
+
+def test_main_login_failure_exits_without_report(wired, monkeypatch, capsys):
+    from amazonorders.exception import AmazonOrdersAuthError
+
+    def fail():
+        raise AmazonOrdersAuthError("bad login")
+
+    monkeypatch.setattr(export, "AmazonSession", lambda config: SimpleNamespace(login=fail))
+    assert run(wired) == 1 and not wired.exists() and "bad login" in capsys.readouterr().err
+
+
+def test_main_feed_failure_exits_without_report(wired, monkeypatch):
+    def boom(days):
+        raise TypeError("missing total")
+
+    patch_txns(monkeypatch, boom)
+    assert run(wired) == 1 and not wired.exists()
+
+
+def test_main_no_credentials_is_a_clear_error(wired, monkeypatch, capsys):
+    monkeypatch.delenv("AMAZON_USERNAME")
+    monkeypatch.delenv("AMAZON_PASSWORD")
+    assert run(wired) == 1 and "AMAZON_USERNAME" in capsys.readouterr().err
+
+
+def test_main_unwritable_output_is_a_clear_error(wired, tmp_path, capsys):
+    (tmp_path / "blocker").write_text("")
+    assert run(tmp_path / "blocker" / "out.md") == 1 and "Could not write" in capsys.readouterr().err
+
+
+def test_main_prints_summary(wired, capsys):
+    run(wired)
+    err = capsys.readouterr().err
+    assert "Unresolved: 1" in err and str(wired) in err

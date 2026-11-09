@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import re
+import sys
 from collections import defaultdict
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field
@@ -408,3 +409,53 @@ def fetch_uncharged_orders(session, charges: list[Charge], start: date, end: dat
                     found[view.order_number] = view
     ordered = sorted(found.values(), key=lambda o: (o.placed_date is None, o.placed_date or date.min))
     return ordered, warnings
+
+
+def _fail(message: str) -> int:
+    print(message, file=sys.stderr)
+    return 1
+
+
+def main(argv: list[str] | None = None, today: date | None = None) -> int:
+    args = parse_args(argv)
+    today = today or date.today()
+    logging.basicConfig(level=logging.WARNING, format="%(levelname)s: %(message)s")
+
+    config = build_config()
+    problem = credentials_problem(config, os.environ)
+    if problem:
+        return _fail(problem)
+
+    try:
+        session = AmazonSession(config=config)
+        session.login()
+    except Exception as error:
+        return _fail(f"Could not log in to Amazon: {error}")
+
+    try:
+        charges, skipped_rows = fetch_charges(session, args.start, args.end, today)
+    except Exception as error:
+        return _fail(f"Could not read Amazon's transactions, so no report was written: {error}")
+
+    attach_orders(session, charges)
+    classify(charges)
+    uncharged, warnings = fetch_uncharged_orders(session, charges, args.start, args.end)
+    if skipped_rows:
+        rows = "1 row" if skipped_rows == 1 else f"{skipped_rows} rows"
+        warnings.insert(0, f"{rows} of Amazon's transactions could not be read, so charges may be missing.")
+
+    report = Report(args.start, args.end, datetime.now(), charges, uncharged, warnings)
+    content = render_json(report) if args.json else render_markdown(report)
+    out = args.out or default_out(args.start, args.end, args.json)
+    try:
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(content, encoding="utf-8")
+    except OSError as error:
+        return _fail(f"Could not write {out}: {error}")
+
+    print(f"{status_counts(charges)}. Report written to {out}", file=sys.stderr)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
