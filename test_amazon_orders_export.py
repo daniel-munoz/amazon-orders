@@ -1,4 +1,5 @@
 import json
+import logging
 from datetime import date, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -6,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 from amazonorders.conf import AmazonOrdersConfig
 from amazonorders.entity.transaction import Transaction
+from amazonorders.exception import AmazonOrdersAuthRedirectError, AmazonOrdersNotFoundError
 
 import amazon_orders_export as export
 
@@ -199,3 +201,113 @@ def test_uncharged_orders_section_marks_cancelled():
 def test_json_round_trips():
     data = json.loads(export.render_json(report([charge()])))
     assert data["charges"][0]["status"] == "Matched" and data["start"] == "2025-03-01"
+
+
+def txn(day, number=ONE, total=-12.99):
+    return SimpleNamespace(completed_date=day, grand_total=total, is_refund=total > 0,
+                           payment_method="Visa ****1234", payment_method_last_4="1234", order_number=number,
+                           order_details_link=None, seller=None)
+
+
+def patch_txns(monkeypatch, fn):
+    monkeypatch.setattr(export, "AmazonTransactions", lambda s: SimpleNamespace(get_transactions=fn))
+
+
+def patch_orders(monkeypatch, **methods):
+    monkeypatch.setattr(export, "AmazonOrders", lambda s: SimpleNamespace(**methods))
+
+
+def lib_order(number=ONE, placed=date(2025, 3, 2)):
+    return SimpleNamespace(order_number=number, order_placed_date=placed, grand_total=1.0, order_details_link=None,
+                           cancelled=False, items=[], shipments=[])
+
+
+def test_build_config(tmp_path):
+    c = export.build_config(str(tmp_path / "c.yml"))
+    assert c.warn_on_missing_required_field is True and c.max_auth_attempts == 3
+
+
+def test_credentials_problem(tmp_path):
+    c_jar = SimpleNamespace(cookie_jar_path=str(tmp_path / "missing.json"))
+    assert "AMAZON_USERNAME" in export.credentials_problem(c_jar, {})
+    assert export.credentials_problem(c_jar, {"AMAZON_USERNAME": "u", "AMAZON_PASSWORD": "p"}) is None
+    (tmp_path / "jar.json").write_text("[]")
+    assert export.credentials_problem(SimpleNamespace(cookie_jar_path=str(tmp_path / "jar.json")), {}) is None
+
+
+def test_fetch_charges_filters_range_and_uses_lookback(monkeypatch):
+    seen = {}
+
+    def get(days):
+        seen["days"] = days
+        return [txn(date(2025, 2, 28)), txn(date(2025, 3, 1)), txn(date(2025, 3, 31)), txn(date(2025, 4, 1))]
+
+    patch_txns(monkeypatch, get)
+    charges, skipped = export.fetch_charges(object(), date(2025, 3, 1), date(2025, 3, 31), date(2025, 4, 10))
+    assert seen["days"] == 41 and [c.date.day for c in charges] == [1, 31] and skipped == 0
+
+
+def test_fetch_charges_counts_rows_the_library_skipped(monkeypatch):
+    def get(days):
+        logging.getLogger("amazonorders.transactions").warning("skipped a row")
+        return []
+
+    patch_txns(monkeypatch, get)
+    assert export.fetch_charges(object(), date(2025, 3, 1), date(2025, 3, 2), date(2025, 3, 3)) == ([], 1)
+
+
+def test_fetch_charges_logs_in_again_once_when_session_expired(monkeypatch):
+    calls, logins = [], []
+
+    def get(days):
+        calls.append(1)
+        if len(calls) == 1:
+            raise AmazonOrdersAuthRedirectError("expired")
+        return []
+
+    patch_txns(monkeypatch, get)
+    export.fetch_charges(SimpleNamespace(login=lambda: logins.append(1)), date(2025, 3, 1), date(2025, 3, 2),
+                         date(2025, 3, 3))
+    assert (len(calls), len(logins)) == (2, 1)
+
+
+def test_attach_orders_looks_up_each_order_once_and_survives_any_error(monkeypatch):
+    calls = []
+
+    def get_order(n):
+        calls.append(n)
+        if n == "bad1":
+            raise AmazonOrdersNotFoundError("gone")
+        if n == "bad2":
+            raise TypeError("title was None")
+        return lib_order(n)
+
+    patch_orders(monkeypatch, get_order=get_order)
+    a, b, c, d, e = (charge(number=n, o=None) for n in [ONE, ONE, "bad1", "bad2", None])
+    export.attach_orders(object(), [a, b, c, d, e])
+    assert calls == [ONE, "bad1", "bad2"] and a.order is b.order is not None
+    assert "gone" in c.lookup_error and "title was None" in d.lookup_error and e.lookup_error is None
+
+
+def test_uncharged_orders_checks_both_histories_dedupes_and_filters(monkeypatch):
+    kinds = []
+
+    def get_orders(year, order_filter=None):
+        kinds.append((year, order_filter))
+        return [lib_order("A"), lib_order(ONE), lib_order("OLD", date(2024, 1, 1)), lib_order("NODATE", None)]
+
+    patch_orders(monkeypatch, get_orders=get_orders)
+    found, warnings = export.fetch_uncharged_orders(object(), [charge()], date(2025, 3, 1), date(2025, 3, 31))
+    assert kinds == [(2025, None), (2025, "digital-orders")] and warnings == []
+    assert [o.order_number for o in found] == ["A", "NODATE"]
+
+
+def test_uncharged_orders_warns_about_the_part_that_failed(monkeypatch):
+    def get_orders(year, order_filter=None):
+        if order_filter:
+            raise RuntimeError("page changed")
+        return []
+
+    patch_orders(monkeypatch, get_orders=get_orders)
+    _, warnings = export.fetch_uncharged_orders(object(), [], date(2025, 3, 1), date(2025, 3, 31))
+    assert len(warnings) == 1 and "digital" in warnings[0] and "2025" in warnings[0]

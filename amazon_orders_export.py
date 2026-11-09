@@ -3,13 +3,25 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
+import os
 import re
 from collections import defaultdict
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field
 from datetime import date, datetime
 from pathlib import Path
 
+from amazonorders.conf import AmazonOrdersConfig
+from amazonorders.exception import AmazonOrdersAuthRedirectError
+from amazonorders.orders import AmazonOrders
+from amazonorders.session import AmazonSession
+from amazonorders.transactions import AmazonTransactions
+
+logger = logging.getLogger("amazon_orders_export")
+
 MATCHED, SPLIT, REFUND, UNRESOLVED = "Matched", "Split", "Refund", "Unresolved"
+DIGITAL_ORDERS_FILTER = "digital-orders"
 
 
 @dataclass
@@ -311,3 +323,88 @@ def render_markdown(report: Report) -> str:
 
 def render_json(report: Report) -> str:
     return json.dumps(asdict(report), default=str, indent=2)
+
+
+def build_config(config_path: str | None = None) -> AmazonOrdersConfig:
+    return AmazonOrdersConfig(config_path=config_path,
+                              data={"warn_on_missing_required_field": True, "max_auth_attempts": 3})
+
+
+def credentials_problem(config, environ: Mapping[str, str]) -> str | None:
+    """Explain what's missing when there's neither a saved session nor credentials to log in with."""
+    if os.path.exists(config.cookie_jar_path) or (environ.get("AMAZON_USERNAME") and environ.get("AMAZON_PASSWORD")):
+        return None
+    return "No saved Amazon session found. Set AMAZON_USERNAME and AMAZON_PASSWORD to log in."
+
+
+class _WarningCounter(logging.Handler):
+    def __init__(self) -> None:
+        super().__init__(level=logging.WARNING)
+        self.count = 0
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.count += 1
+
+
+def fetch_charges(session, start: date, end: date, today: date) -> tuple[list[Charge], int]:
+    """Return the charges in range, and how many transaction rows the library skipped as unreadable."""
+    days = lookback_days(start, today)
+    counter = _WarningCounter()
+    library_logger = logging.getLogger("amazonorders.transactions")
+    library_logger.addHandler(counter)
+    try:
+        try:
+            transactions = AmazonTransactions(session).get_transactions(days=days)
+        except AmazonOrdersAuthRedirectError:
+            # The saved session expired; login() starts fresh after a redirect to sign-in.
+            counter.count = 0
+            session.login()
+            transactions = AmazonTransactions(session).get_transactions(days=days)
+    finally:
+        library_logger.removeHandler(counter)
+    charges = [to_charge(t) for t in transactions if start <= t.completed_date <= end]
+    return charges, counter.count
+
+
+def attach_orders(session, charges: list[Charge]) -> None:
+    """Look up each distinct order once; a failure only affects the charges on that order."""
+    amazon_orders = AmazonOrders(session)
+    results: dict[str, OrderView | str] = {}
+    for charge in charges:
+        number = charge.order_number
+        if not number:
+            continue
+        if number not in results:
+            try:
+                results[number] = to_order_view(amazon_orders.get_order(number))
+            except Exception as error:
+                logger.warning("Could not load order %s: %s", number, error)
+                results[number] = str(error) or type(error).__name__
+        result = results[number]
+        if isinstance(result, str):
+            charge.lookup_error = result
+        else:
+            charge.order = result
+
+
+def fetch_uncharged_orders(session, charges: list[Charge], start: date, end: date) -> tuple[list[OrderView], list[str]]:
+    """Find orders placed in range with no charge, from both the regular and the digital history."""
+    amazon_orders = AmazonOrders(session)
+    charged = {c.order_number for c in charges if c.order_number}
+    found: dict[str, OrderView] = {}
+    warnings: list[str] = []
+    for year in years_in_range(start, end):
+        for order_filter, label in ((None, "regular"), (DIGITAL_ORDERS_FILTER, "digital")):
+            try:
+                orders = amazon_orders.get_orders(year=year, order_filter=order_filter)
+                views = [to_order_view(o) for o in orders]
+            except Exception as error:
+                logger.warning("Could not check %s orders for %s: %s", label, year, error)
+                warnings.append(f"Could not check {label} orders for {year}, so some orders may be missing here: {error}")
+                continue
+            for view in views:
+                in_range = view.placed_date is None or start <= view.placed_date <= end
+                if in_range and view.order_number not in charged:
+                    found[view.order_number] = view
+    ordered = sorted(found.values(), key=lambda o: (o.placed_date is None, o.placed_date or date.min))
+    return ordered, warnings
