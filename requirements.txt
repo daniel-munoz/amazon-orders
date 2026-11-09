@@ -1,0 +1,2 @@
+--index-url https://pypi.org/simple
+amazon-orders==5.3.0

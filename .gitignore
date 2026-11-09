@@ -1,0 +1,15 @@
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+
+# Credentials
+.env
+.env.*
+
+# Exported order history (personal data)
+*.csv
+orders*.json
+
+# amazon-orders debug output
+output/
