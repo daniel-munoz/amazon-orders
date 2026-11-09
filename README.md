@@ -35,6 +35,16 @@ need to be there with their phone. Later runs reuse the saved session in
 `~/.config/amazonorders/cookies.json`. If this machine also uses another Amazon login, set
 `AMAZON_COOKIE_JAR_PATH` to a separate file so the wrong account's session is never reused.
 
+If login fails with "JavaScript-based sign-in challenge", or the saved session has expired, sign in
+on Amazon's own page instead. It opens a browser window for the account holder, and no password is
+needed in the environment:
+
+```sh
+.venv/bin/amazon-orders login --browser
+```
+
+Then run the report as usual. It reuses the session that command saved.
+
 Item images only appear in a viewer that renders Markdown and loads remote images. A plain text
 editor shows the raw text.
 
