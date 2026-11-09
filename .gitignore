@@ -10,6 +10,7 @@ __pycache__/
 # Exported order history (personal data)
 *.csv
 orders*.json
+reports/
 
 # amazon-orders debug output
 output/
