@@ -25,10 +25,14 @@ export AMAZON_USERNAME=...
 export AMAZON_PASSWORD=...
 export AMAZON_OTP_SECRET_KEY=...   # optional, for app-based two-step verification
 
-.venv/bin/python amazon_orders_export.py --start 2025-01-01 --end 2025-06-30 [--out PATH] [--json]
+.venv/bin/python amazon_orders_export.py --start 2025-01-01 --end 2025-06-30 [--card 1234] [--out PATH] [--json]
 ```
 
 The report goes to `reports/` by default. Dates are compared with the charge date.
+
+`--card` limits the report to purchases and refunds on the card with those last four digits, so it
+can be checked against that card's statement. Charges Amazon lists without a card number are left
+out and counted in a warning at the top. The "Orders with no charge found" section is omitted.
 
 The first login may ask for a CAPTCHA or a one-time code at the terminal, so the account holder may
 need to be there with their phone. Later runs reuse the saved session in

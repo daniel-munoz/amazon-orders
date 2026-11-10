@@ -139,7 +139,7 @@ def test_split_charge_block():
     a, b = charge(amount=12.99, o=order(total=27.98), day=14), charge(amount=14.99, o=order(total=27.98), day=15)
     md = export.render_markdown(report([a, b]))
     assert r"### 2025-03-14 · $12.99 · Visa \*\*\*\*1234 · Split" in md
-    assert "Charge 1 of 2 for this order. Charges in this report total $27.98." in md
+    assert "Charge 1 of 2 for this order. Charges in this period, on any card, total $27.98." in md
     assert "These items can't be attributed to this specific charge." in md
     assert "**Book**, qty 1, $12.99" in md and "![Book](https://m.media-amazon.com/i.jpg)" in md
 
@@ -212,9 +212,10 @@ def test_json_round_trips():
     assert data["charges"][0]["status"] == "Matched" and data["start"] == "2025-03-01"
 
 
-def txn(day, number=ONE, total=-12.99):
+def txn(day, number=ONE, total=-12.99, card="1234"):
     return SimpleNamespace(completed_date=day, grand_total=total, is_refund=total > 0,
-                           payment_method="Visa ****1234", payment_method_last_4="1234", order_number=number,
+                           payment_method=f"Visa ****{card}" if card else "Amazon Gift Card",
+                           payment_method_last_4=card, order_number=number,
                            order_details_link=None, seller=None)
 
 
@@ -524,6 +525,115 @@ def test_main_no_credentials_is_a_clear_error(wired, monkeypatch, capsys):
 def test_main_unwritable_output_is_a_clear_error(wired, tmp_path, capsys):
     (tmp_path / "blocker").write_text("")
     assert run(tmp_path / "blocker" / "out.md") == 1 and "Could not write" in capsys.readouterr().err
+
+
+TWO = "111-0000000-0000002"
+MARCH_14, MARCH_15 = date(2025, 3, 14), date(2025, 3, 15)
+
+
+def lib_order_with_item(number):
+    book = SimpleNamespace(title="Book", quantity=1, price=15.0, asin="B1", link=None, image_link=None)
+    return SimpleNamespace(order_number=number, order_placed_date=date(2025, 3, 2), grand_total=15.0,
+                           order_details_link=None, cancelled=False, items=[book], shipments=[])
+
+
+def card_report(out, monkeypatch, txns):
+    patch_txns(monkeypatch, lambda days: txns)
+    assert run(out, extra=["--card", "1234"]) == 0
+    return out.read_text(encoding="utf-8")
+
+
+def test_parse_args_reads_card_and_keeps_leading_zeros():
+    assert export.parse_args([*ARGS, "--card", "0042"]).card == "0042"
+
+
+def test_parse_args_card_is_optional():
+    assert export.parse_args(ARGS).card is None
+
+
+@pytest.mark.parametrize("card", ["123", "12345", "12a4", "", "١٢٣٤"])
+def test_parse_args_rejects_anything_but_four_digits(card):
+    with pytest.raises(SystemExit) as e:
+        export.parse_args([*ARGS, "--card", card])
+    assert e.value.code == 2
+
+
+def test_card_report_keeps_only_charges_on_that_card(wired, monkeypatch):
+    md = card_report(wired, monkeypatch, [txn(MARCH_14, ONE), txn(MARCH_15, TWO, card="9999")])
+    assert ONE in md and TWO not in md
+
+
+def test_card_report_includes_refunds_on_that_card(wired, monkeypatch):
+    md = card_report(wired, monkeypatch, [txn(MARCH_14, ONE, total=5.0)])
+    assert "Refund: 1" in md
+
+
+def test_card_report_counts_only_that_card(wired, monkeypatch, capsys):
+    md = card_report(wired, monkeypatch, [txn(MARCH_14, ONE, total=5.0), txn(MARCH_15, TWO, total=6.0, card="9999")])
+    assert "Refund: 1" in md and "Refund: 1" in capsys.readouterr().err
+
+
+def test_card_report_keeps_numbering_of_an_order_split_across_cards(wired, monkeypatch):
+    patch_orders(monkeypatch, get_order=lib_order_with_item, get_orders=lambda year, order_filter=None: [])
+    md = card_report(wired, monkeypatch, [txn(MARCH_14, ONE, total=-10.0), txn(MARCH_15, ONE, total=-5.0, card="9999")])
+    assert "Charge 1 of 2" in md and "on any card, total $15.00" in md
+    assert "### 2025-03-15" not in md
+
+
+def test_card_report_only_looks_up_orders_on_that_card(wired, monkeypatch):
+    looked_up = []
+    patch_orders(monkeypatch, get_order=lambda n: looked_up.append(n) or lib_order(n),
+                 get_orders=lambda year, order_filter=None: [])
+    card_report(wired, monkeypatch, [txn(MARCH_14, ONE), txn(MARCH_15, TWO, card="9999")])
+    assert looked_up == [ONE]
+
+
+def test_card_report_warns_about_charges_with_no_card_number(wired, monkeypatch):
+    md = card_report(wired, monkeypatch, [txn(MARCH_14, ONE), txn(MARCH_15, TWO, card=None)])
+    assert TWO not in md
+    assert "**Warning:** 1 charge had no card number" in md
+
+
+def test_card_report_has_no_warning_when_every_charge_has_a_card_number(wired, monkeypatch):
+    md = card_report(wired, monkeypatch, [txn(MARCH_14, ONE), txn(MARCH_15, TWO, card="9999")])
+    assert "no card number" not in md
+
+
+def test_card_report_skips_orders_with_no_charge(wired, monkeypatch):
+    checked = []
+    patch_orders(monkeypatch, get_order=lambda n: lib_order(n),
+                 get_orders=lambda year, order_filter=None: checked.append(year) or [lib_order(TWO)])
+    md = card_report(wired, monkeypatch, [txn(MARCH_14, ONE)])
+    assert "Orders with no charge found" not in md and checked == []
+
+
+def test_card_report_title_names_the_card(wired, monkeypatch):
+    md = card_report(wired, monkeypatch, [txn(MARCH_14, ONE)])
+    assert md.splitlines()[0] == "# Amazon charges, 2025-03-01 to 2025-03-31, card ending 1234"
+
+
+def test_card_report_json_names_the_card(wired, monkeypatch):
+    patch_txns(monkeypatch, lambda days: [txn(MARCH_14, ONE)])
+    assert run(wired, extra=["--card", "1234", "--json"]) == 0
+    assert json.loads(wired.read_text(encoding="utf-8"))["card"] == "1234"
+
+
+def test_card_report_default_filename_does_not_overwrite_the_full_report(wired, monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    assert export.main([*ARGS, "--card", "1234"], today=date(2025, 4, 1)) == 0
+    assert (tmp_path / "reports" / "amazon-charges_2025-03-01_2025-03-31_card-1234.md").exists()
+    assert not (tmp_path / "reports" / "amazon-charges_2025-03-01_2025-03-31.md").exists()
+
+
+def test_report_without_card_keeps_every_charge_and_checks_uncharged_orders(wired, monkeypatch):
+    patch_orders(monkeypatch, get_order=lambda n: lib_order(n),
+                 get_orders=lambda year, order_filter=None: [lib_order("111-0000000-0000003")])
+    patch_txns(monkeypatch, lambda days: [txn(MARCH_14, ONE), txn(MARCH_15, TWO, card=None)])
+    assert run(wired) == 0
+    md = wired.read_text(encoding="utf-8")
+    assert ONE in md and TWO in md
+    assert "no card number" not in md and "Orders with no charge found" in md
+    assert md.splitlines()[0] == "# Amazon charges, 2025-03-01 to 2025-03-31"
 
 
 def test_main_prints_summary(wired, capsys):

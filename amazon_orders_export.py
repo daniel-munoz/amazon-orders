@@ -91,6 +91,7 @@ class Report:
     charges: list[Charge]
     uncharged_orders: list[OrderView]
     warnings: list[str]
+    card: str | None = None
 
 
 def _iso_date(value: str) -> date:
@@ -100,21 +101,29 @@ def _iso_date(value: str) -> date:
         raise argparse.ArgumentTypeError(f"{value!r} is not a valid YYYY-MM-DD date")
 
 
+def _last_four(value: str) -> str:
+    if not re.fullmatch(r"[0-9]{4}", value):
+        raise argparse.ArgumentTypeError(f"{value!r} is not the last four digits of a card")
+    return value
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--start", type=_iso_date, required=True, help="first charge date, YYYY-MM-DD")
     parser.add_argument("--end", type=_iso_date, required=True, help="last charge date, YYYY-MM-DD")
     parser.add_argument("--out", type=Path, help="output path (default: under reports/)")
     parser.add_argument("--json", action="store_true", help="write JSON instead of Markdown")
+    parser.add_argument("--card", type=_last_four, help="only include charges on the card with these last four digits")
     args = parser.parse_args(argv)
     if args.end < args.start:
         parser.error("--end must not be before --start")
     return args
 
 
-def default_out(start: date, end: date, as_json: bool) -> Path:
+def default_out(start: date, end: date, as_json: bool, card: str | None = None) -> Path:
     extension = "json" if as_json else "md"
-    return Path("reports") / f"amazon-charges_{start}_{end}.{extension}"
+    card_suffix = f"_card-{card}" if card else ""
+    return Path("reports") / f"amazon-charges_{start}_{end}{card_suffix}.{extension}"
 
 
 def lookback_days(start: date, today: date) -> int:
@@ -254,7 +263,7 @@ def _status_lines(charge: Charge) -> list[str]:
     elif charge.status == SPLIT:
         if (charge.charge_count or 0) > 1:
             lines.append(f"Charge {charge.charge_index} of {charge.charge_count} for this order. "
-                         f"Charges in this report total {_money(charge.charges_total)}.")
+                         f"Charges in this period, on any card, total {_money(charge.charges_total)}.")
         else:
             lines.append("This is the only charge found for this order, and it differs from the order total.")
         lines.append("These items can't be attributed to this specific charge.")
@@ -310,8 +319,9 @@ def render_markdown(report: Report) -> str:
     unresolved = [c for c in charges if c.status == UNRESOLVED]
     resolved = [c for c in charges if c.status != UNRESOLVED]
 
+    title = f"# Amazon charges, {report.start} to {report.end}"
     parts = [
-        f"# Amazon charges, {report.start} to {report.end}",
+        f"{title}, card ending {report.card}" if report.card else title,
         f"Generated {report.generated_at:%Y-%m-%d %H:%M}",
         status_counts(charges),
     ]
@@ -404,6 +414,14 @@ def fetch_charges(session, start: date, end: date, today: date) -> tuple[list[Ch
     return charges, counter.count, {t.order_number for t in transactions if t.order_number}
 
 
+def no_card_number_warnings(charges: list[Charge]) -> list[str]:
+    missing = sum(not c.last_4 for c in charges)
+    if not missing:
+        return []
+    subject, verb = ("1 charge", "was") if missing == 1 else (f"{missing} charges", "were")
+    return [f"{subject} had no card number and {verb} left out, but could belong to this card."]
+
+
 def attach_orders(session, charges: list[Charge]) -> None:
     """Look up each distinct order once; a failure only affects the charges on that order."""
     amazon_orders = AmazonOrders(session)
@@ -485,28 +503,35 @@ def main(argv: list[str] | None = None, today: date | None = None) -> int:
 
     try:
         charges, skipped_rows, seen_order_numbers = fetch_charges(session, args.start, args.end, today)
-        attach_orders(session, charges)
+        selected = [c for c in charges if c.last_4 == args.card] if args.card else charges
+        attach_orders(session, selected)
     except LoginFailed as error:
         return _fail(f"{error} No report was written.")
     except Exception as error:
         return _fail(f"Could not read Amazon's transactions, so no report was written: {error}")
 
+    # Classify every charge, so an order split across cards keeps its numbering in a one-card report.
     classify(charges)
-    uncharged, warnings = fetch_uncharged_orders(session, charges, args.start, args.end, seen_order_numbers)
+    if args.card:
+        # Orders with no charge have no card, so they can't be part of a one-card report.
+        uncharged: list[OrderView] = []
+        warnings = no_card_number_warnings(charges)
+    else:
+        uncharged, warnings = fetch_uncharged_orders(session, charges, args.start, args.end, seen_order_numbers)
     if skipped_rows:
         rows = "1 row" if skipped_rows == 1 else f"{skipped_rows} rows"
         warnings.insert(0, f"{rows} of Amazon's transactions could not be read, so charges may be missing.")
 
-    report = Report(args.start, args.end, datetime.now(), charges, uncharged, warnings)
+    report = Report(args.start, args.end, datetime.now(), selected, uncharged, warnings, args.card)
     content = render_json(report) if args.json else render_markdown(report)
-    out = args.out or default_out(args.start, args.end, args.json)
+    out = args.out or default_out(args.start, args.end, args.json, args.card)
     try:
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(content, encoding="utf-8")
     except OSError as error:
         return _fail(f"Could not write {out}: {error}")
 
-    print(f"{status_counts(charges)}. Report written to {out}", file=sys.stderr)
+    print(f"{status_counts(selected)}. Report written to {out}", file=sys.stderr)
     return 0
 
 
