@@ -1,0 +1,29 @@
+# Runs Code Review Assistant on the files a pull request changes and uploads
+# the findings to GitHub code scanning, which shows them as inline PR
+# annotations. See https://github.com/daniel-munoz/code-review-assistant
+
+name: CRA
+
+on:
+  pull_request:
+    branches: [ "main" ]
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+
+  analyze:
+    runs-on: ubuntu-latest
+    steps:
+    # A shallow checkout is fine: the action fetches the history it needs
+    - uses: actions/checkout@v6
+
+    # The action diffs against the PR base branch, uploads SARIF (category
+    # "cra"), writes a job summary and keeps the JSON report as the
+    # "cra-report" artifact. @v1 follows the latest 1.x release
+    - uses: daniel-munoz/code-review-assistant@v1
+      with:
+        preset: standard
+        fail-on: error
