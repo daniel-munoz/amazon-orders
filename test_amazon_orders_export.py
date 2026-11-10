@@ -183,10 +183,17 @@ def test_items_render_as_image_and_details_table():
     piped = export.ItemView("A | B", 2, 5.0, None, None, None)
     o = export.OrderView(ONE, None, 17.99, None, False, [], [item(), piped])
     md = export.render_markdown(report([charge(amount=17.99, o=o)]))
-    assert ("| **Book**<br>qty 1<br>$12.99<br>[product page](https://www.amazon.com/dp/B000000001) | "
-            "![Book](https://m.media-amazon.com/i.jpg) |\n|---|---|\n"
+    assert ("|  |  |\n|---|---|\n"
+            "| **Book**<br>qty 1<br>$12.99<br>[product page](https://www.amazon.com/dp/B000000001) | "
+            "![Book](https://m.media-amazon.com/i.jpg) |\n"
             r"| **A \| B**<br>qty 2<br>$5.00 |  |") in md
+
+
+def test_single_item_fills_the_header_row():
+    md = export.render_markdown(report([charge()]))
     assert "|  |  |" not in md
+    assert "| **Book**<br>qty 1<br>$12.99<br>[product page](https://www.amazon.com/dp/B000000001) | " \
+           "![Book](https://m.media-amazon.com/i.jpg) |\n|---|---|" in md
 
 
 def test_shipment_items_share_one_table_without_shipment_label():
@@ -201,6 +208,11 @@ def test_shipment_items_share_one_table_without_shipment_label():
 def test_refund_notes_its_purchase():
     md = export.render_markdown(report([charge(day=14), charge(refund=True, day=20)]))
     assert "Refund" in md and "2025-03-20" in md and "2025-03-14" in md
+
+
+def test_refund_heading_shows_negative_amount():
+    md = export.render_markdown(report([charge(day=14), charge(refund=True, day=20)]))
+    assert "### 2025-03-20 · -$12.99 · " in md and "### 2025-03-14 · $12.99 · " in md
 
 
 def test_order_line_and_statement_text():

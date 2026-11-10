@@ -251,9 +251,12 @@ def _item_row(item: ItemView) -> str:
 
 def _items_table(items: list[ItemView]) -> str:
     # A table is the only Markdown layout that puts the thumbnail beside its details. The syntax
-    # requires a header row, so the first item fills it rather than leaving a blank row.
+    # requires a header row: a lone item fills it, but with several items Google Docs styles the
+    # header item differently from the rest, so they get an empty header row instead.
     rows = [_item_row(item) for item in items]
-    return "\n".join([rows[0], "|---|---|", *rows[1:]])
+    if len(rows) == 1:
+        return "\n".join([rows[0], "|---|---|"])
+    return "\n".join(["|  |  |", "|---|---|", *rows])
 
 
 def _items_block(order: OrderView) -> list[str]:
@@ -295,7 +298,8 @@ ENTRY_SEPARATOR = "---"
 
 
 def _charge_block(charge: Charge) -> str:
-    heading = f"### {charge.date} · {_money(charge.amount)} · {escape_md(charge.payment_method)} · {charge.status}"
+    amount = f"-{_money(charge.amount)}" if charge.is_refund else _money(charge.amount)
+    heading = f"### {charge.date} · {amount} · {escape_md(charge.payment_method)} · {charge.status}"
     parts = [heading]
     if charge.order:
         parts.append(_order_summary(charge.order))
