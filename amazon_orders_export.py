@@ -269,6 +269,9 @@ def _status_lines(charge: Charge) -> list[str]:
     return lines
 
 
+ENTRY_SEPARATOR = "---"
+
+
 def _charge_block(charge: Charge) -> str:
     heading = f"### {charge.date} · {_money(charge.amount)} · {escape_md(charge.payment_method)} · {charge.status}"
     parts = [heading]
@@ -284,6 +287,7 @@ def _charge_block(charge: Charge) -> str:
         parts.append(f"[View order]({order_link})")
     if charge.order:
         parts.extend(_items_block(charge.order))
+    parts.append(ENTRY_SEPARATOR)
     return "\n\n".join(parts)
 
 
@@ -293,6 +297,7 @@ def _uncharged_block(order: OrderView) -> str:
     if order_link:
         parts.append(f"[View order]({order_link})")
     parts.extend(_items_block(order))
+    parts.append(ENTRY_SEPARATOR)
     return "\n\n".join(parts)
 
 

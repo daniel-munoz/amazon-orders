@@ -198,6 +198,15 @@ def test_uncharged_orders_section_marks_cancelled():
     assert "## Orders with no charge found" in md and "D01-1" in md and "cancelled" in md
 
 
+def test_every_entry_ends_with_a_separator():
+    o = export.OrderView("D01-1", date(2025, 3, 2), None, None, True, [], [item()])
+    md = export.render_markdown(report([charge(day=1), charge(o=order(total=None), day=20)], uncharged=[o]))
+    entries = [e.split("\n\n## ")[0].rstrip("\n") for e in md.split("### ")[1:]]
+    assert len(entries) == 3
+    # The blank line matters: "---" directly under text would turn that text into a heading.
+    assert all(e.endswith("\n\n---") for e in entries)
+
+
 def test_json_round_trips():
     data = json.loads(export.render_json(report([charge()])))
     assert data["charges"][0]["status"] == "Matched" and data["start"] == "2025-03-01"
