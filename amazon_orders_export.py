@@ -221,31 +221,44 @@ def safe_url(url: str | None) -> str | None:
     return url.replace(" ", "%20").replace("(", "%28").replace(")", "%29")
 
 
+# Google Docs imports images at their native pixel size, so request a small one from Amazon's
+# image CDN, which resizes on the fly from a modifier before the extension (id._SL100_.jpg).
+THUMBNAIL_PX = 100
+_AMAZON_IMAGE = re.compile(r"^(https://(?:m\.media-amazon\.com|images-na\.ssl-images-amazon\.com)"
+                           r"/(?:[^?#]*/)?images/I/[^./]+)(?:\.[^/]*)?(\.(?:jpe?g|png|gif))$", re.IGNORECASE)
+
+
+def thumbnail_url(url: str) -> str:
+    return _AMAZON_IMAGE.sub(rf"\g<1>._SL{THUMBNAIL_PX}_\g<2>", url)
+
+
 def _money(amount: float | None) -> str:
     return "not available" if amount is None else f"${amount:,.2f}"
 
 
-def _item_lines(item: ItemView) -> list[str]:
-    title = escape_md(item.title or "Title not available")
+def _item_row(item: ItemView) -> str:
+    title = escape_md(item.title or "Title not available").replace("|", r"\|")
     quantity = "qty not available" if item.quantity is None else f"qty {item.quantity}"
     price = "price not available" if item.price is None else _money(item.price)
-    details = f"**{title}**, {quantity}, {price}"
+    lines = [f"**{title}**", quantity, price]
     product_page = safe_url(item.link)
     if product_page:
-        details += f", [product page]({product_page})"
-    image = safe_url(item.image_link)
-    return [f"- ![{title}]({image})\n  {details}"] if image else [f"- {details}"]
+        lines.append(f"[product page]({product_page})")
+    image = safe_url(item.image_link and thumbnail_url(item.image_link))
+    # A table cell can't hold a newline, so <br> is the only way to stack the details.
+    return f"| {'<br>'.join(lines)} | {f'![{title}]({image})' if image else ''} |"
+
+
+def _items_table(items: list[ItemView]) -> str:
+    # A table is the only Markdown layout that puts the thumbnail beside its details. The syntax
+    # requires a header row, so the first item fills it rather than leaving a blank row.
+    rows = [_item_row(item) for item in items]
+    return "\n".join([rows[0], "|---|---|", *rows[1:]])
 
 
 def _items_block(order: OrderView) -> list[str]:
-    shipments = [s for s in order.shipments if s.items]
-    if not shipments:
-        return ["\n".join(line for item in order.items for line in _item_lines(item))] if order.items else []
-    blocks: list[str] = []
-    for shipment in shipments:
-        blocks.append(f"**Shipment: {escape_md(shipment.status)}**")
-        blocks.append("\n".join(line for item in shipment.items for line in _item_lines(item)))
-    return blocks
+    items = [item for shipment in order.shipments for item in shipment.items] or order.items
+    return [_items_table(items)] if items else []
 
 
 def _order_summary(order: OrderView) -> str:

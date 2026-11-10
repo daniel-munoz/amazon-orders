@@ -135,13 +135,30 @@ def test_safe_url():
     assert export.safe_url("javascript:alert(1)") is None and export.safe_url(None) is None
 
 
+def test_thumbnail_url_requests_small_image_from_amazon_cdn():
+    base = "https://m.media-amazon.com/images/I/71abcXYZ"
+    assert export.thumbnail_url(f"{base}.jpg") == f"{base}._SL100_.jpg"
+    assert export.thumbnail_url(f"{base}._SS142_.jpg") == f"{base}._SL100_.jpg"
+    assert export.thumbnail_url(f"{base}._AC_UL600_SR600,400_.png") == f"{base}._SL100_.png"
+    routed = "https://m.media-amazon.com/images/W/BW_MEDIAX_AVIF_MEASUREMENT_1306696-T4/images/I/71DUrSuIEgL"
+    assert export.thumbnail_url(f"{routed}._SS284_.jpg") == f"{routed}._SL100_.jpg"
+    assert export.thumbnail_url("https://example.com/images/I/x.jpg") == "https://example.com/images/I/x.jpg"
+    assert export.thumbnail_url("https://m.media-amazon.com/i.jpg") == "https://m.media-amazon.com/i.jpg"
+
+
+def test_item_image_uses_thumbnail():
+    big = export.ItemView("Book", 1, 12.99, None, None, "https://m.media-amazon.com/images/I/71abc._SS500_.jpg")
+    md = export.render_markdown(report([charge(o=export.OrderView(ONE, None, 12.99, None, False, [], [big]))]))
+    assert "![Book](https://m.media-amazon.com/images/I/71abc._SL100_.jpg)" in md
+
+
 def test_split_charge_block():
     a, b = charge(amount=12.99, o=order(total=27.98), day=14), charge(amount=14.99, o=order(total=27.98), day=15)
     md = export.render_markdown(report([a, b]))
     assert r"### 2025-03-14 · $12.99 · Visa \*\*\*\*1234 · Split" in md
     assert "Charge 1 of 2 for this order. Charges in this period, on any card, total $27.98." in md
     assert "These items can't be attributed to this specific charge." in md
-    assert "**Book**, qty 1, $12.99" in md and "![Book](https://m.media-amazon.com/i.jpg)" in md
+    assert "**Book**<br>qty 1<br>$12.99" in md and "![Book](https://m.media-amazon.com/i.jpg)" in md
 
 
 def test_single_split_explains_the_difference():
@@ -162,11 +179,23 @@ def test_missing_image_and_fields_still_render():
     assert "![" not in md and "not available" in md
 
 
-def test_shipments_group_items():
-    o = export.OrderView(ONE, date(2025, 3, 1), 12.99, None, False,
-                         [export.ShipmentView("Delivered March 15", [item()])], [item()])
-    md = export.render_markdown(report([charge(o=o)]))
-    assert "**Shipment: Delivered March 15**" in md and md.count("**Book**") == 1
+def test_items_render_as_image_and_details_table():
+    piped = export.ItemView("A | B", 2, 5.0, None, None, None)
+    o = export.OrderView(ONE, None, 17.99, None, False, [], [item(), piped])
+    md = export.render_markdown(report([charge(amount=17.99, o=o)]))
+    assert ("| **Book**<br>qty 1<br>$12.99<br>[product page](https://www.amazon.com/dp/B000000001) | "
+            "![Book](https://m.media-amazon.com/i.jpg) |\n|---|---|\n"
+            r"| **A \| B**<br>qty 2<br>$5.00 |  |") in md
+    assert "|  |  |" not in md
+
+
+def test_shipment_items_share_one_table_without_shipment_label():
+    o = export.OrderView(ONE, date(2025, 3, 1), 25.98, None, False,
+                         [export.ShipmentView("Delivered March 15", [item("Book")]),
+                          export.ShipmentView("Delivered March 16", [item("Pen")])], [item("Book"), item("Pen")])
+    md = export.render_markdown(report([charge(amount=25.98, o=o)]))
+    assert "Shipment" not in md and "Delivered" not in md
+    assert md.count("**Book**") == 1 and md.count("**Pen**") == 1 and md.count("|---|---|") == 1
 
 
 def test_refund_notes_its_purchase():
